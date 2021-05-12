@@ -36,7 +36,10 @@ use embedded_hal::digital::v2::OutputPin;
 /// - The SPIM instances share the same address space with instances of SPIS,
 ///   SPI, TWIM, TWIS, and TWI. You need to make sure that conflicting instances
 ///   are disabled before using `Spim`. See product specification, section 15.2.
-pub struct Spim<T>(T);
+pub struct Spim<T> {
+	inner: T,
+	dma_in_progress: Option<(u32, u32)>
+}
 
 impl<T> embedded_hal::blocking::spi::Transfer<u8> for Spim<T>
 where
@@ -49,7 +52,8 @@ where
         slice_in_ram_or(words, Error::DMABufferNotInDataMemory)?;
 
         words.chunks(EASY_DMA_SIZE).try_for_each(|chunk| {
-            self.do_spi_dma_transfer(DmaSlice::from_slice(chunk), DmaSlice::from_slice(chunk))
+            self.do_spi_dma_transfer(DmaSlice::from_slice(chunk), DmaSlice::from_slice(chunk))?;
+	    self.wait_for_dma_completion()
         })?;
 
         Ok(words)
@@ -154,20 +158,27 @@ where
             // there.
             unsafe { w.orc().bits(orc) });
 
-        Spim(spim)
+        Spim { inner: spim, dma_in_progress: None }
     }
 
     /// Internal helper function to setup and execute SPIM DMA transfer.
     fn do_spi_dma_transfer(&mut self, tx: DmaSlice, rx: DmaSlice) -> Result<(), Error> {
+	loop {
+	    match self.dma_in_progress {
+	    Some(_) => { self.wait_for_dma_completion()?; }
+	    None => { break; }}
+	}
+
         // Conservative compiler fence to prevent optimizations that do not
         // take in to account actions by DMA. The fence has been placed here,
         // before any DMA action has started.
         compiler_fence(SeqCst);
+	self.dma_in_progress = Some((tx.len, rx.len));
 
         // Set up the DMA write.
-        self.0.txd.ptr.write(|w| unsafe { w.ptr().bits(tx.ptr) });
+        self.inner.txd.ptr.write(|w| unsafe { w.ptr().bits(tx.ptr) });
 
-        self.0.txd.maxcnt.write(|w|
+        self.inner.txd.maxcnt.write(|w|
             // Note that that nrf52840 maxcnt is a wider.
             // type than a u8, so we use a `_` cast rather than a `u8` cast.
             // The MAXCNT field is thus at least 8 bits wide and accepts the full
@@ -175,46 +186,57 @@ where
             unsafe { w.maxcnt().bits(tx.len as _ ) });
 
         // Set up the DMA read.
-        self.0.rxd.ptr.write(|w|
+        self.inner.rxd.ptr.write(|w|
             // This is safe for the same reasons that writing to TXD.PTR is
             // safe. Please refer to the explanation there.
             unsafe { w.ptr().bits(rx.ptr) });
-        self.0.rxd.maxcnt.write(|w|
+        self.inner.rxd.maxcnt.write(|w|
             // This is safe for the same reasons that writing to TXD.MAXCNT is
             // safe. Please refer to the explanation there.
             unsafe { w.maxcnt().bits(rx.len as _) });
 
         // Start SPI transaction.
-        self.0.tasks_start.write(|w|
+        self.inner.tasks_start.write(|w|
             // `1` is a valid value to write to task registers.
             unsafe { w.bits(1) });
 
+	Ok(())
+    }
+
+    fn wait_for_dma_completion(&mut self) -> Result<(), Error> {
         // Conservative compiler fence to prevent optimizations that do not
         // take in to account actions by DMA. The fence has been placed here,
         // after all possible DMA actions have completed.
         compiler_fence(SeqCst);
 
-        // Wait for END event.
-        //
-        // This event is triggered once both transmitting and receiving are
-        // done.
-        while self.0.events_end.read().bits() == 0 {}
+	match self.dma_in_progress {
+	None => { Ok(()) }
+	Some(t) => {
+            // Wait for END event.
+            //
+            // This event is triggered once both transmitting and receiving are
+            // done.
+            while self.inner.events_end.read().bits() == 0 {}
 
-        // Reset the event, otherwise it will always read `1` from now on.
-        self.0.events_end.write(|w| w);
+            // Reset the event, otherwise it will always read `1` from now on.
+            self.inner.events_end.write(|w| w);
 
-        // Conservative compiler fence to prevent optimizations that do not
-        // take in to account actions by DMA. The fence has been placed here,
-        // after all possible DMA actions have completed.
-        compiler_fence(SeqCst);
+            // Conservative compiler fence to prevent optimizations that do not
+            // take in to account actions by DMA. The fence has been placed here,
+            // after all possible DMA actions have completed.
+            compiler_fence(SeqCst);
 
-        if self.0.txd.amount.read().bits() != tx.len {
-            return Err(Error::Transmit);
-        }
-        if self.0.rxd.amount.read().bits() != rx.len {
-            return Err(Error::Receive);
-        }
-        Ok(())
+            if self.inner.txd.amount.read().bits() != t.0 {
+	        self.dma_in_progress = None;
+                return Err(Error::Transmit);
+            }
+            if self.inner.rxd.amount.read().bits() != t.1 {
+	        self.dma_in_progress = None;
+                return Err(Error::Receive);
+            }
+	    self.dma_in_progress = None;
+            Ok(())
+	}}
     }
 
     /// Read and write from a SPI slave, using a single buffer.
@@ -236,7 +258,8 @@ where
 
         // Don't return early, as we must reset the CS pin.
         let res = buffer.chunks(EASY_DMA_SIZE).try_for_each(|chunk| {
-            self.do_spi_dma_transfer(DmaSlice::from_slice(chunk), DmaSlice::from_slice(chunk))
+            self.do_spi_dma_transfer(DmaSlice::from_slice(chunk), DmaSlice::from_slice(chunk))?;
+	    self.wait_for_dma_completion()
         });
 
         chip_select.set_high().unwrap();
@@ -272,7 +295,8 @@ where
 
         // Don't return early, as we must reset the CS pin
         let res = txi.zip(rxi).try_for_each(|(t, r)| {
-            self.do_spi_dma_transfer(DmaSlice::from_slice(t), DmaSlice::from_slice(r))
+            self.do_spi_dma_transfer(DmaSlice::from_slice(t), DmaSlice::from_slice(r))?;
+	    self.wait_for_dma_completion()
         });
 
         chip_select.set_high().unwrap();
@@ -336,7 +360,10 @@ where
                         .unwrap_or_else(DmaSlice::null),
                 )
             })
-            .try_for_each(|(t, r)| self.do_spi_dma_transfer(t, r));
+            .try_for_each(|(t, r)| {
+		self.do_spi_dma_transfer(t, r)?;
+		self.wait_for_dma_completion()
+		});
 
         chip_select.set_high().unwrap();
 
@@ -359,7 +386,7 @@ where
 
     /// Return the raw interface to the underlying SPIM peripheral.
     pub fn free(self) -> T {
-        self.0
+        self.inner
     }
 }
 
