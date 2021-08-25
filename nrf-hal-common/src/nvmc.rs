@@ -68,7 +68,7 @@ where
     #[cfg(not(feature = "9160"))]
     #[inline]
     fn erase_page(&mut self, offset: usize) {
-        let bits = &mut (self.storage[offset as usize >> 2]) as *mut _ as u32;
+        let bits = &mut (self.storage[offset >> 2]) as *mut _ as u32;
         self.nvmc.erasepage().write(|w| unsafe { w.bits(bits) });
         self.wait_ready();
     }
@@ -76,7 +76,7 @@ where
     #[cfg(feature = "9160")]
     #[inline]
     fn erase_page(&mut self, offset: usize) {
-        self.storage[offset as usize >> 2] = 0xffffffff;
+        self.storage[offset >> 2] = 0xffffffff;
         self.wait_ready();
     }
 
@@ -86,9 +86,46 @@ where
         self.wait_ready();
         #[cfg(feature = "9160")]
         self.wait_write_ready();
-        self.storage[offset] = word;
+        self.storage[offset >> 2] = word;
         cortex_m::asm::dmb();
     }
+
+    pub fn try_read_nonmut(&self, offset: u32, bytes: &mut [u8]) -> Result<(), NvmcError> {
+        let offset = offset as usize;
+        let bytes_len = bytes.len();
+
+	if offset + bytes_len > self.capacity() {
+		return Err(NvmcError::OutOfBounds);
+	}
+
+	let read_count = bytes_len / Self::READ_SIZE;
+
+	self.wait_ready();
+	for i in 0..read_count {
+		let word = self.storage[(offset >> 2) + i];
+		bytes[(i << 2)] = (word >> 24) as u8;
+		bytes[(i << 2) + 1] = (word >> 16) as u8;
+		bytes[(i << 2) + 2] = (word >>  8) as u8;
+		bytes[(i << 2) + 3] = (word      ) as u8;
+	}
+
+	let partial_word_bytes = bytes_len % Self::READ_SIZE;
+	if partial_word_bytes != 0 {
+		let word = self.storage[(offset >> 2) + read_count];
+		bytes[(read_count << 2)] = (word >> 24) as u8;
+		if partial_word_bytes > 1 {
+			bytes[(read_count << 2) + 1] = (word >> 16) as u8;
+		}
+		if partial_word_bytes > 2 {
+			bytes[(read_count << 2) + 2] = (word >>  8) as u8;
+		}
+		if partial_word_bytes > 3 {
+			bytes[(read_count << 2) + 3] = (word >>  0) as u8;
+		}
+	}
+        Ok(())
+    }
+
 }
 
 impl<T> ReadNorFlash for Nvmc<T>
@@ -100,42 +137,7 @@ where
     const READ_SIZE: usize = 4;
 
     fn try_read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
-        let offset = offset as usize;
-        let bytes_len = bytes.len();
-        let read_len = bytes_len + (Self::READ_SIZE - (bytes_len % Self::READ_SIZE));
-        let target_offset = offset + read_len;
-        if offset % Self::READ_SIZE == 0 && target_offset <= self.capacity() {
-            self.wait_ready();
-            let last_offset = target_offset - Self::READ_SIZE;
-            for offset in (offset..last_offset).step_by(Self::READ_SIZE) {
-                let word = self.storage[offset >> 2];
-                bytes[offset] = (word >> 24) as u8;
-                bytes[offset + 1] = (word >> 16) as u8;
-                bytes[offset + 2] = (word >> 8) as u8;
-                bytes[offset + 3] = (word >> 0) as u8;
-            }
-            let offset = last_offset;
-            let word = self.storage[offset >> 2];
-            let mut bytes_offset = offset;
-            if bytes_offset < bytes_len {
-                bytes[bytes_offset] = (word >> 24) as u8;
-                bytes_offset += 1;
-                if bytes_offset < bytes_len {
-                    bytes[bytes_offset] = (word >> 16) as u8;
-                    bytes_offset += 1;
-                    if bytes_offset < bytes_len {
-                        bytes[bytes_offset] = (word >> 8) as u8;
-                        bytes_offset += 1;
-                        if bytes_offset < bytes_len {
-                            bytes[bytes_offset] = (word >> 0) as u8;
-                        }
-                    }
-                }
-            }
-            Ok(())
-        } else {
-            Err(NvmcError::Unaligned)
-        }
+	self.try_read_nonmut(offset, bytes)
     }
 
     fn capacity(&self) -> usize {
@@ -152,34 +154,44 @@ where
     const ERASE_SIZE: usize = 4 * 1024;
 
     fn try_erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
-        if from as usize % Self::ERASE_SIZE == 0 && to as usize % Self::ERASE_SIZE == 0 {
-            self.enable_erase();
-            for offset in (from..to).step_by(Self::ERASE_SIZE) {
+	let from = from as usize;
+	let to = to as usize;
+
+        if to % Self::ERASE_SIZE != 0 || to as usize % Self::ERASE_SIZE != 0 {
+		return Err(NvmcError::Unaligned);
+	}
+
+        self.enable_erase();
+        for offset in (from..to).step_by(Self::ERASE_SIZE) {
                 self.erase_page(offset as usize >> 2);
-            }
-            self.enable_read();
-            Ok(())
-        } else {
-            Err(NvmcError::Unaligned)
         }
+        Ok(())
     }
 
     fn try_write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
         let offset = offset as usize;
-        if offset % Self::WRITE_SIZE == 0 && bytes.len() % Self::WRITE_SIZE == 0 {
-            self.enable_write();
-            for offset in (offset..(offset + bytes.len())).step_by(Self::WRITE_SIZE) {
-                let word = ((bytes[offset] as u32) << 24)
-                    | ((bytes[offset + 1] as u32) << 16)
-                    | ((bytes[offset + 2] as u32) << 8)
-                    | ((bytes[offset + 3] as u32) << 0);
-                self.write_word(offset >> 2, word);
-            }
-            self.enable_read();
-            Ok(())
-        } else {
-            Err(NvmcError::Unaligned)
+
+        if offset % Self::WRITE_SIZE != 0 || bytes.len() % Self::WRITE_SIZE != 0 {
+		return Err(NvmcError::Unaligned);
+	}
+
+	if offset + bytes.len() > self.capacity() {
+		return Err(NvmcError::OutOfBounds);
+	}
+
+	let write_count = bytes.len() / Self::WRITE_SIZE;
+
+        self.enable_write();
+	for i in 0..write_count {
+                let word = ((bytes[(i << 2)] as u32) << 24)
+                    | ((bytes[(i << 2) + 1] as u32) << 16)
+                    | ((bytes[(i << 2) + 2] as u32) << 8)
+                    | ((bytes[(i << 2) + 3] as u32) << 0);
+
+                self.write_word(offset + (i << 2), word);
         }
+        self.enable_read();
+        Ok(())
     }
 }
 
@@ -199,4 +211,5 @@ mod sealed {
 pub enum NvmcError {
     /// An operation was attempted on an unaligned boundary
     Unaligned,
+    OutOfBounds
 }
