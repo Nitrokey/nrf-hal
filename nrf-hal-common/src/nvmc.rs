@@ -94,6 +94,10 @@ where
         let offset = offset as usize;
         let bytes_len = bytes.len();
 
+        if offset % Self::READ_SIZE != 0 || bytes.len() % Self::READ_SIZE != 0 {
+		return Err(NvmcError::Unaligned);
+	}
+
 	if offset + bytes_len > self.capacity() {
 		return Err(NvmcError::OutOfBounds);
 	}
@@ -102,27 +106,12 @@ where
 
 	self.wait_ready();
 	for i in 0..read_count {
-		let word = self.storage[(offset >> 2) + i];
-		bytes[(i << 2)] = (word >> 24) as u8;
-		bytes[(i << 2) + 1] = (word >> 16) as u8;
-		bytes[(i << 2) + 2] = (word >>  8) as u8;
-		bytes[(i << 2) + 3] = (word      ) as u8;
+		let wordbytes = self.storage[(offset >> 2) + i].to_ne_bytes();
+		for j in 0..4 {
+			bytes[(i << 2) + j] = wordbytes[j];
+		}
 	}
 
-	let partial_word_bytes = bytes_len % Self::READ_SIZE;
-	if partial_word_bytes != 0 {
-		let word = self.storage[(offset >> 2) + read_count];
-		bytes[(read_count << 2)] = (word >> 24) as u8;
-		if partial_word_bytes > 1 {
-			bytes[(read_count << 2) + 1] = (word >> 16) as u8;
-		}
-		if partial_word_bytes > 2 {
-			bytes[(read_count << 2) + 2] = (word >>  8) as u8;
-		}
-		if partial_word_bytes > 3 {
-			bytes[(read_count << 2) + 3] = (word >>  0) as u8;
-		}
-	}
         Ok(())
     }
 
@@ -157,7 +146,7 @@ where
 	let from = from as usize;
 	let to = to as usize;
 
-        if to % Self::ERASE_SIZE != 0 || to as usize % Self::ERASE_SIZE != 0 {
+        if from % Self::ERASE_SIZE != 0 || to % Self::ERASE_SIZE != 0 {
 		return Err(NvmcError::Unaligned);
 	}
 
@@ -165,6 +154,7 @@ where
         for offset in (from..to).step_by(Self::ERASE_SIZE) {
                 self.erase_page(offset as usize >> 2);
         }
+	self.enable_read();
         Ok(())
     }
 
@@ -183,12 +173,8 @@ where
 
         self.enable_write();
 	for i in 0..write_count {
-                let word = ((bytes[(i << 2)] as u32) << 24)
-                    | ((bytes[(i << 2) + 1] as u32) << 16)
-                    | ((bytes[(i << 2) + 2] as u32) << 8)
-                    | ((bytes[(i << 2) + 3] as u32) << 0);
-
-                self.write_word(offset + (i << 2), word);
+		use core::convert::TryInto;
+                self.write_word(offset + (i << 2), u32::from_ne_bytes(bytes[(i<<2)..(i<<2)+4].try_into().unwrap()));
         }
         self.enable_read();
         Ok(())
