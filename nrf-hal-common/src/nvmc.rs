@@ -108,6 +108,16 @@ where
         let target: &mut u32 = unsafe { core::mem::transmute(target) };
         *target = word;
     }
+
+    pub fn read_nonmut(&self, offset: u32, bytes: &mut [u8]) -> Result<(), <Nvmc<T> as ErrorType>::Error> {
+        let offset = offset as usize;
+        if bytes.len() > self.capacity() || offset > self.capacity() - bytes.len() {
+            return Err(NvmcError::OutOfBounds);
+        }
+        self.wait_ready();
+        bytes.copy_from_slice(&self.storage[offset..][..bytes.len()]);
+        Ok(())
+    }
 }
 
 impl<T: Instance> ErrorType for Nvmc<T> {
@@ -121,13 +131,7 @@ where
     const READ_SIZE: usize = 1;
 
     fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
-        let offset = offset as usize;
-        if bytes.len() > self.capacity() || offset > self.capacity() - bytes.len() {
-            return Err(NvmcError::OutOfBounds);
-        }
-        self.wait_ready();
-        bytes.copy_from_slice(&self.storage[offset..][..bytes.len()]);
-        Ok(())
+        self.read_nonmut(offset, bytes)
     }
 
     fn capacity(&self) -> usize {
